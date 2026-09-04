@@ -11,7 +11,8 @@ from __future__ import annotations
 * 标准嵌套字段是事实源，写出前强制检查扁平别名与它完全相同。
 
 同一个 agent 的相邻 round 只有在语义上下文连续时才合并。比较时会忽略每轮都会
-变化但不改变对话语义的 billing cch、cache_control 和 thinking signature。
+变化但不改变对话语义的 billing cch、cache_control 和 thinking signature，也会
+统一字符串与单个 text block 两种等价表示。工具只新增且旧定义不变时仍视为连续。
 """
 
 import argparse
@@ -179,11 +180,59 @@ def remove_nonsemantic_fields(value: Any) -> Any:
     return result
 
 
+def normalized_content_for_context(content: Any) -> Any:
+    """规范化 Anthropic content 中不影响语义的等价表示。
+
+    Claude Code 在当前请求和后续历史重放中，可能把同一段文本分别编码为字符串和
+    ``[{"type": "text", "text": ...}]``。ShareGPT 转换结果会把两者都变成相同
+    文本，因此上下文比较也应把字符串规范化为单个 text block。tool_result.content
+    同样支持这两种表示。
+    """
+
+    normalized = remove_nonsemantic_fields(content)
+    if isinstance(normalized, str):
+        return [{"type": "text", "text": normalized}]
+    if not isinstance(normalized, list):
+        return normalized
+
+    blocks: list[Any] = []
+    for block in normalized:
+        if isinstance(block, dict) and block.get("type") == "tool_result":
+            normalized_block = dict(block)
+            nested_content = normalized_block.get("content", "")
+            if isinstance(nested_content, str):
+                normalized_block["content"] = [
+                    {"type": "text", "text": nested_content}
+                ]
+            blocks.append(normalized_block)
+        else:
+            blocks.append(block)
+    return blocks
+
+
+def normalized_message_for_context(message: Any) -> Any:
+    """清理消息元数据，并统一 user/assistant 的 content 表示。"""
+
+    normalized = remove_nonsemantic_fields(message)
+    if not isinstance(normalized, dict):
+        return normalized
+    if normalized.get("role") not in {"user", "assistant"}:
+        return normalized
+
+    result = dict(normalized)
+    result["content"] = normalized_content_for_context(result.get("content", ""))
+    return result
+
+
 def normalized_system(system: Any) -> Any:
     """删除每轮 cch 都会变化的内部 billing header，再进行语义规范化。"""
 
     if isinstance(system, str):
-        return None if system.lstrip().startswith(BILLING_HEADER_PREFIX) else system
+        return (
+            []
+            if system.lstrip().startswith(BILLING_HEADER_PREFIX)
+            else normalized_content_for_context(system)
+        )
     if system is None:
         return []
     blocks = require_list(system, "request.system")
@@ -197,18 +246,56 @@ def normalized_system(system: Any) -> Any:
         ):
             continue
         kept.append(block)
-    return remove_nonsemantic_fields(kept)
+    return normalized_content_for_context(kept)
 
 
 def normalized_messages(messages: Any) -> list[Any]:
-    return require_list(remove_nonsemantic_fields(messages), "request.messages")
+    source_messages = require_list(messages, "request.messages")
+    return [normalized_message_for_context(message) for message in source_messages]
+
+
+def tools_context_compatible(previous_tools: Any, current_tools: Any) -> bool:
+    """判断当前工具是否完整保留全部旧工具及其定义。
+
+    ShareGPT 每个文件只有一个顶层 tools 数组，并取自 segment 的最后一轮。只要工具
+    集合单调增加，最后一轮就能覆盖此前所有工具；删除工具、修改旧定义、重名或无名
+    工具仍会触发切分。工具顺序本身不影响可用性。
+    """
+
+    normalized_previous = remove_nonsemantic_fields(previous_tools)
+    normalized_current = remove_nonsemantic_fields(current_tools)
+    if not isinstance(normalized_previous, list) or not isinstance(
+        normalized_current, list
+    ):
+        return normalized_previous == normalized_current
+
+    def index_by_name(tools: list[Any]) -> Optional[dict[str, dict[str, Any]]]:
+        indexed: dict[str, dict[str, Any]] = {}
+        for tool in tools:
+            if not isinstance(tool, dict):
+                return None
+            name = tool.get("name")
+            if not isinstance(name, str) or not name or name in indexed:
+                return None
+            indexed[name] = tool
+        return indexed
+
+    previous_by_name = index_by_name(normalized_previous)
+    current_by_name = index_by_name(normalized_current)
+    if previous_by_name is None or current_by_name is None:
+        return False
+    return all(
+        current_by_name.get(name) == definition
+        for name, definition in previous_by_name.items()
+    )
 
 
 def context_continues(previous: RoundRecord, current: RoundRecord) -> bool:
     """判断 current 是否是 previous 的同一语义上下文继续增长。
 
-    除 model/system/tools 一致外，current.messages 必须保留 previous.messages 的
-    完整规范化前缀，并紧接着包含 previous response 的 assistant content。
+    model/system 必须一致；tools 可以只新增，但所有旧工具必须保留且定义不变。
+    current.messages 必须保留 previous.messages 的完整规范化前缀，并紧接着包含
+    previous response 的 assistant content。
     """
 
     previous_request = previous.request_body
@@ -219,8 +306,8 @@ def context_continues(previous: RoundRecord, current: RoundRecord) -> bool:
         current_request.get("system")
     ):
         return False
-    if remove_nonsemantic_fields(previous_request.get("tools", [])) != remove_nonsemantic_fields(
-        current_request.get("tools", [])
+    if not tools_context_compatible(
+        previous_request.get("tools", []), current_request.get("tools", [])
     ):
         return False
 
@@ -231,7 +318,7 @@ def context_continues(previous: RoundRecord, current: RoundRecord) -> bool:
     if new_messages[: len(old_messages)] != old_messages:
         return False
 
-    expected_assistant = remove_nonsemantic_fields(
+    expected_assistant = normalized_message_for_context(
         {"role": "assistant", "content": previous.response_message.get("content")}
     )
     return new_messages[len(old_messages)] == expected_assistant

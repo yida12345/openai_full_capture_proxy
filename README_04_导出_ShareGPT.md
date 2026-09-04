@@ -58,7 +58,7 @@ sharegpt_output/run_20260803/
     └── subagent_<agent_id>_1.json
 ```
 
-同一个 agent 的相邻 round 在 model、实质 system、tools 和消息历史连续时合并；billing cch、`cache_control` 和 thinking `signature` 的变化不会误触发切分。发生真正的上下文压缩、历史替换或 system/tools/model 变化时，从该 round 开始生成下一个文件。
+同一个 agent 的相邻 round 在 model、实质 system 和消息历史连续时合并；billing cch、`cache_control`、thinking `signature` 以及字符串/单个 text block 的等价表示不会误触发切分。当新请求只增加工具、且已有工具定义未变时，仍属于同一上下文，最终文件使用 segment 最后一轮的工具全集。发生真正的上下文压缩、历史替换、system/model 变化、工具删除或已有工具定义改变时，从该 round 开始生成下一个文件。
 
 ## 工具调用兼容格式
 

@@ -646,6 +646,106 @@ class ShareGPTExportTests(unittest.TestCase):
         )
         self.assertFalse(context_continues(first, changed))
 
+    def test_equivalent_string_and_text_block_content_does_not_split(self):
+        tool = {
+            "name": "Bash",
+            "description": "执行命令",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        notification = "<task-notification>done</task-notification>"
+        response_content = [{"type": "text", "text": "已处理"}]
+        previous = RoundRecord(
+            number=1,
+            round_dir=Path("round_000001"),
+            request_body={
+                "model": "test-model",
+                "system": "你是编码助手",
+                "tools": [tool],
+                "messages": [
+                    {
+                        "role": "user",
+                        "content": [{"type": "text", "text": notification}],
+                    }
+                ],
+            },
+            response_message={"role": "assistant", "content": response_content},
+        )
+        current = RoundRecord(
+            number=2,
+            round_dir=Path("round_000002"),
+            request_body={
+                "model": "test-model",
+                "system": [{"type": "text", "text": "你是编码助手"}],
+                "tools": [tool],
+                "messages": [
+                    {"role": "user", "content": notification},
+                    {"role": "assistant", "content": response_content},
+                    {"role": "user", "content": "继续"},
+                ],
+            },
+            response_message={
+                "role": "assistant",
+                "content": [{"type": "text", "text": "完成"}],
+            },
+        )
+
+        self.assertTrue(context_continues(previous, current))
+
+    def test_monotonic_tool_addition_does_not_split_context(self):
+        first, second = self._rounds()
+        remote_trigger = {
+            "name": "RemoteTrigger",
+            "description": "触发远端任务",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        expanded = RoundRecord(
+            number=second.number,
+            round_dir=second.round_dir,
+            request_body=dict(
+                second.request_body,
+                tools=[*second.request_body["tools"], remote_trigger],
+            ),
+            response_message=second.response_message,
+        )
+
+        self.assertTrue(context_continues(first, expanded))
+        record = build_sharegpt_record(
+            [first, expanded], "task__main__1", "separate"
+        )
+        self.assertEqual(
+            [tool["name"] for tool in record["tools"]],
+            ["Bash", "RemoteTrigger"],
+        )
+
+    def test_tool_removal_or_definition_change_still_splits_context(self):
+        first, second = self._rounds()
+        remote_trigger = {
+            "name": "RemoteTrigger",
+            "description": "触发远端任务",
+            "input_schema": {"type": "object", "properties": {}},
+        }
+        previous_with_extra_tool = RoundRecord(
+            number=first.number,
+            round_dir=first.round_dir,
+            request_body=dict(
+                first.request_body,
+                tools=[*first.request_body["tools"], remote_trigger],
+            ),
+            response_message=first.response_message,
+        )
+        changed_definition = RoundRecord(
+            number=second.number,
+            round_dir=second.round_dir,
+            request_body=dict(
+                second.request_body,
+                tools=[dict(second.request_body["tools"][0], description="不同定义")],
+            ),
+            response_message=second.response_message,
+        )
+
+        self.assertFalse(context_continues(previous_with_extra_tool, second))
+        self.assertFalse(context_continues(first, changed_definition))
+
     def test_hybrid_format_and_reasoning_modes(self):
         first, second = self._rounds()
         separate = build_sharegpt_record(
