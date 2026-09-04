@@ -1,0 +1,983 @@
+from __future__ import annotations
+
+import gzip
+import json
+import tempfile
+import unittest
+from pathlib import Path
+from unittest import mock
+
+from capture_core import (
+    AnthropicMessageAggregator,
+    RequestCapture,
+    SSEDecoder,
+    header_records,
+    write_json,
+)
+from finalize import CaptureRecord, final_request, final_response, finalize_dataset
+from export_sharegpt import (
+    RoundRecord,
+    build_sharegpt_record,
+    context_continues,
+    export_sharegpt,
+    validate_hybrid_tool_call,
+    validate_hybrid_tool_definition,
+)
+from proxy import parse_args
+
+
+TEST_TMP_ROOT = Path(__file__).resolve().parents[1] / ".test_tmp"
+TEST_TMP_ROOT.mkdir(parents=True, exist_ok=True)
+
+
+def workspace_temporary_directory():
+    # 沙箱环境可能禁止写系统 TEMP，测试临时目录固定放在项目工作区内。
+    return tempfile.TemporaryDirectory(dir=TEST_TMP_ROOT)
+
+
+def sse(event: str, payload: dict) -> bytes:
+    body = json.dumps(payload, ensure_ascii=False, separators=(",", ":"))
+    return f"event: {event}\ndata: {body}\n\n".encode("utf-8")
+
+
+def complete_text_stream(message_id: str, text: str) -> bytes:
+    return b"".join(
+        [
+            sse(
+                "message_start",
+                {
+                    "type": "message_start",
+                    "message": {
+                        "id": message_id,
+                        "type": "message",
+                        "role": "assistant",
+                        "model": "test-model",
+                        "content": [],
+                        "stop_reason": None,
+                        "stop_sequence": None,
+                        "usage": {"input_tokens": 2, "output_tokens": 1},
+                    },
+                },
+            ),
+            sse(
+                "content_block_start",
+                {
+                    "type": "content_block_start",
+                    "index": 0,
+                    "content_block": {"type": "text", "text": ""},
+                },
+            ),
+            sse(
+                "content_block_delta",
+                {
+                    "type": "content_block_delta",
+                    "index": 0,
+                    "delta": {"type": "text_delta", "text": text},
+                },
+            ),
+            sse(
+                "content_block_stop",
+                {"type": "content_block_stop", "index": 0},
+            ),
+            sse(
+                "message_delta",
+                {
+                    "type": "message_delta",
+                    "delta": {"stop_reason": "end_turn", "stop_sequence": None},
+                    "usage": {"output_tokens": 3},
+                },
+            ),
+            sse("message_stop", {"type": "message_stop"}),
+        ]
+    )
+
+
+class AggregatorTests(unittest.TestCase):
+    def test_stream_can_be_aggregated_across_arbitrary_chunks(self):
+        raw = complete_text_stream("msg_text", "你好")
+        decoder = SSEDecoder(AnthropicMessageAggregator())
+        records = []
+        for offset in range(0, len(raw), 7):
+            records.extend(decoder.feed(raw[offset : offset + 7]))
+        records.extend(decoder.finish())
+
+        self.assertGreater(len(records), 0)
+        self.assertTrue(decoder.aggregator.complete)
+        self.assertEqual(decoder.aggregator.message_id, "msg_text")
+        self.assertEqual(decoder.aggregator.message["content"][0]["text"], "你好")
+        self.assertEqual(decoder.aggregator.message["stop_reason"], "end_turn")
+        self.assertEqual(decoder.aggregator.message["usage"]["output_tokens"], 3)
+
+    def test_thinking_and_tool_input_are_aggregated(self):
+        decoder = SSEDecoder(AnthropicMessageAggregator())
+        raw = b"".join(
+            [
+                sse(
+                    "message_start",
+                    {
+                        "type": "message_start",
+                        "message": {
+                            "id": "msg_tool",
+                            "type": "message",
+                            "role": "assistant",
+                            "model": "test-model",
+                            "content": [],
+                            "stop_reason": None,
+                            "usage": {},
+                        },
+                    },
+                ),
+                sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": 0,
+                        "content_block": {
+                            "type": "thinking",
+                            "thinking": "",
+                            "signature": "",
+                        },
+                    },
+                ),
+                sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "thinking_delta", "thinking": "分析"},
+                    },
+                ),
+                sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 0,
+                        "delta": {"type": "signature_delta", "signature": "sig"},
+                    },
+                ),
+                sse("content_block_stop", {"type": "content_block_stop", "index": 0}),
+                sse(
+                    "content_block_start",
+                    {
+                        "type": "content_block_start",
+                        "index": 1,
+                        "content_block": {
+                            "type": "tool_use",
+                            "id": "toolu_1",
+                            "name": "Bash",
+                            "input": {},
+                        },
+                    },
+                ),
+                sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 1,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": '{"command":',
+                        },
+                    },
+                ),
+                sse(
+                    "content_block_delta",
+                    {
+                        "type": "content_block_delta",
+                        "index": 1,
+                        "delta": {
+                            "type": "input_json_delta",
+                            "partial_json": '"pwd"}',
+                        },
+                    },
+                ),
+                sse("content_block_stop", {"type": "content_block_stop", "index": 1}),
+                sse("message_stop", {"type": "message_stop"}),
+            ]
+        )
+        decoder.feed(raw)
+        decoder.finish()
+        message = decoder.aggregator.message
+        self.assertEqual(message["content"][0]["thinking"], "分析")
+        self.assertEqual(message["content"][0]["signature"], "sig")
+        self.assertEqual(message["content"][1]["input"], {"command": "pwd"})
+
+
+class CaptureIsolationTests(unittest.TestCase):
+    def test_two_interleaved_streams_never_share_files(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_a = RequestCapture(root, "cap_a")
+            capture_b = RequestCapture(root, "cap_b")
+            for capture in (capture_a, capture_b):
+                capture.start_request(
+                    method="POST",
+                    path="/v1/messages",
+                    query="",
+                    url="http://proxy/v1/messages",
+                    headers=[("content-type", "application/json")],
+                    raw_body=b'{"model":"test"}',
+                    upstream_url="http://upstream/v1/messages",
+                    client_host="127.0.0.1",
+                    client_port=1000,
+                )
+                capture.start_response(
+                    status_code=200,
+                    headers=[("content-type", "text/event-stream")],
+                    is_sse=True,
+                )
+
+            raw_a = complete_text_stream("msg_a", "A")
+            raw_b = complete_text_stream("msg_b", "B")
+            midpoint_a = len(raw_a) // 2
+            midpoint_b = len(raw_b) // 2
+            capture_a.append_response(raw_a[:midpoint_a])
+            capture_b.append_response(raw_b[:midpoint_b])
+            capture_a.append_response(raw_a[midpoint_a:])
+            capture_b.append_response(raw_b[midpoint_b:])
+            capture_a.finalize()
+            capture_b.finalize()
+
+            response_a = json.loads((root / "completed/cap_a/response.json").read_text("utf-8"))
+            response_b = json.loads((root / "completed/cap_b/response.json").read_text("utf-8"))
+            self.assertEqual(response_a["message_id"], "msg_a")
+            self.assertEqual(response_b["message_id"], "msg_b")
+            self.assertNotIn(b"msg_b", (root / "completed/cap_a/response.body").read_bytes())
+            self.assertNotIn(b"msg_a", (root / "completed/cap_b/response.body").read_bytes())
+
+    def test_gzip_sse_keeps_raw_body_and_still_aggregates(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture = RequestCapture(root, "cap_gzip")
+            capture.start_request(
+                method="POST",
+                path="/v1/messages",
+                query="",
+                url="http://proxy/v1/messages",
+                headers=[("content-type", "application/json")],
+                raw_body=b"{}",
+                upstream_url="http://upstream/v1/messages",
+                client_host="127.0.0.1",
+                client_port=1000,
+            )
+            capture.start_response(
+                status_code=200,
+                headers=[
+                    ("content-type", "text/event-stream"),
+                    ("content-encoding", "gzip"),
+                ],
+                is_sse=True,
+            )
+            compressed = gzip.compress(complete_text_stream("msg_gzip", "压缩"))
+            capture.append_response(compressed)
+            capture.finalize()
+            response = json.loads(
+                (root / "completed/cap_gzip/response.json").read_text("utf-8")
+            )
+            self.assertEqual(response["message_id"], "msg_gzip")
+            self.assertEqual(response["message"]["content"][0]["text"], "压缩")
+            self.assertEqual(
+                (root / "completed/cap_gzip/response.body").read_bytes(), compressed
+            )
+
+
+class FinalizerTests(unittest.TestCase):
+    def _write_capture(self, root: Path, capture_id: str, message_id: str) -> None:
+        directory = root / "raw/completed" / capture_id
+        directory.mkdir(parents=True)
+        request_body = json.dumps(
+            {
+                "model": "test-model",
+                "max_tokens": 10,
+                "messages": [{"role": "user", "content": message_id}],
+                "stream": True,
+            },
+            separators=(",", ":"),
+        ).encode()
+        response_body = complete_text_stream(message_id, "ok")
+        (directory / "request.body").write_bytes(request_body)
+        (directory / "response.body").write_bytes(response_body)
+        write_json(
+            directory / "request.json",
+            {
+                "capture_id": capture_id,
+                "captured_at": "2026-01-01T00:00:00Z",
+                "path": "/v1/messages",
+                "is_messages_request": True,
+            },
+        )
+        write_json(
+            directory / "response.json",
+            {
+                "capture_id": capture_id,
+                "message_id": message_id,
+                "stream": True,
+                "message": {"id": message_id, "type": "message", "content": []},
+            },
+        )
+        write_json(directory / "state.json", {"state": "complete"})
+
+    def test_harbor_main_and_subagent_are_finalized(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_root = root / "captures"
+            harbor_root = root / "harbor-run"
+            output_root = root / "dataset"
+            self._write_capture(capture_root, "cap_main", "msg_main")
+            self._write_capture(capture_root, "cap_sub", "msg_sub")
+
+            task_root = harbor_root / "tasks/task_a"
+            write_json(
+                task_root / "final_status.json",
+                {"task_id": "task:a", "agent_id": "harbor-agent-1"},
+            )
+            project = task_root / "logs/run/cc_session/.claude/projects/-workspace"
+            project.mkdir(parents=True)
+            main_lines = [
+                {
+                    "type": "assistant",
+                    "sessionId": "session-1",
+                    "uuid": "u1",
+                    "timestamp": "2026-01-01T00:00:01Z",
+                    "message": {"id": "msg_main", "content": [{"type": "text", "text": "a"}]},
+                },
+                {
+                    "type": "assistant",
+                    "sessionId": "session-1",
+                    "uuid": "u2",
+                    "timestamp": "2026-01-01T00:00:02Z",
+                    "message": {"id": "msg_main", "content": [{"type": "tool_use"}]},
+                },
+            ]
+            (project / "session-1.jsonl").write_text(
+                "\n".join(json.dumps(item) for item in main_lines) + "\n",
+                encoding="utf-8",
+            )
+            subagents = project / "session-1/subagents"
+            subagents.mkdir(parents=True)
+            (subagents / "agent-sub1.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": "session-1",
+                        "agentId": "sub1",
+                        "isSidechain": True,
+                        "timestamp": "2026-01-01T00:00:03Z",
+                        "message": {"id": "msg_sub", "content": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = finalize_dataset(capture_root, harbor_root, output_root)
+            self.assertEqual(report["matched"], 2)
+            self.assertEqual(report["tasks"], 1)
+            main_response = json.loads(
+                (output_root / "tasks/task_a/main_agent/round_000001/response.json").read_text("utf-8")
+            )
+            self.assertEqual(main_response["association"]["fragment_count"], 2)
+            self.assertEqual(main_response["association"]["round"], 1)
+            self.assertTrue(
+                (output_root / "tasks/task_a/subagent_sub1/round_000001/request.json").exists()
+            )
+
+    def test_acompact_mirror_is_owned_by_main_without_hiding_compact_response(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_root = root / "captures"
+            harbor_root = root / "harbor-run"
+            output_root = root / "dataset"
+            self._write_capture(capture_root, "cap_work", "msg_work")
+            self._write_capture(capture_root, "cap_compact", "msg_compact")
+
+            task_root = harbor_root / "tasks/task_a"
+            project = task_root / "logs/run/cc_session/.claude/projects/-workspace"
+            project.mkdir(parents=True)
+            mirrored_message = {
+                "id": "msg_work",
+                "content": [{"type": "text", "text": "work"}],
+            }
+            (project / "session-1.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": "session-1",
+                        "uuid": "event-work",
+                        "isSidechain": False,
+                        "timestamp": "2026-01-01T00:00:01Z",
+                        "message": mirrored_message,
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subagents = project / "session-1/subagents"
+            subagents.mkdir(parents=True)
+            (subagents / "agent-acompact-auto.jsonl").write_text(
+                "\n".join(
+                    json.dumps(item)
+                    for item in (
+                        {
+                            "type": "assistant",
+                            "sessionId": "session-1",
+                            "uuid": "event-work",
+                            "agentId": "acompact-auto",
+                            "isSidechain": True,
+                            "timestamp": "2026-01-01T00:00:01Z",
+                            "message": mirrored_message,
+                        },
+                        {
+                            "type": "assistant",
+                            "sessionId": "session-1",
+                            "uuid": "event-compact",
+                            "agentId": "acompact-auto",
+                            "isSidechain": True,
+                            "timestamp": "2026-01-01T00:00:02Z",
+                            "message": {
+                                "id": "msg_compact",
+                                "content": [{"type": "text", "text": "summary"}],
+                            },
+                        },
+                    )
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = finalize_dataset(capture_root, harbor_root, output_root)
+
+            self.assertEqual(report["matched"], 2)
+            self.assertEqual(report["conflicts"], 0)
+            self.assertEqual(
+                report["session_scan"]["acompact_mirror_message_ids"], 1
+            )
+            main_request = json.loads(
+                (
+                    output_root
+                    / "tasks/task_a/main_agent/round_000001/request.json"
+                ).read_text("utf-8")
+            )
+            self.assertEqual(main_request["association"]["message_id"], "msg_work")
+            compact_request = json.loads(
+                (
+                    output_root
+                    / "tasks/task_a/subagent_acompact-auto/round_000001/request.json"
+                ).read_text("utf-8")
+            )
+            self.assertEqual(
+                compact_request["association"]["message_id"], "msg_compact"
+            )
+
+    def test_acompact_same_message_id_without_identical_event_remains_conflict(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            capture_root = root / "captures"
+            harbor_root = root / "harbor-run"
+            output_root = root / "dataset"
+            self._write_capture(capture_root, "cap_shared", "msg_shared")
+
+            task_root = harbor_root / "tasks/task_a"
+            project = task_root / "logs/run/cc_session/.claude/projects/-workspace"
+            project.mkdir(parents=True)
+            (project / "session-1.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": "session-1",
+                        "uuid": "event-main",
+                        "message": {"id": "msg_shared", "content": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+            subagents = project / "session-1/subagents"
+            subagents.mkdir(parents=True)
+            (subagents / "agent-acompact-other.jsonl").write_text(
+                json.dumps(
+                    {
+                        "type": "assistant",
+                        "sessionId": "session-1",
+                        "uuid": "event-other",
+                        "agentId": "acompact-other",
+                        "isSidechain": True,
+                        "message": {"id": "msg_shared", "content": []},
+                    }
+                )
+                + "\n",
+                encoding="utf-8",
+            )
+
+            report = finalize_dataset(capture_root, harbor_root, output_root)
+
+            self.assertEqual(report["matched"], 0)
+            self.assertEqual(report["conflicts"], 1)
+
+
+class OutputPartsTests(unittest.TestCase):
+    def setUp(self):
+        # body 文件不存在时 final_request/final_response 会使用空 bytes，足以验证
+        # 顶层字段白名单而不创建测试目录。
+        self.record = CaptureRecord(
+            capture_dir=Path("__nonexistent_capture_for_output_parts_test__"),
+            request={"capture_id": "cap_parts"},
+            response={},
+            state={},
+        )
+
+    def test_removing_parts_really_removes_top_level_output(self):
+        request = final_request(
+            self.record,
+            None,
+            output_parts=["capture_id", "body"],
+        )
+        response = final_response(
+            self.record,
+            None,
+            output_parts=["message", "state"],
+        )
+        self.assertEqual(list(request), ["capture_id", "body"])
+        self.assertEqual(list(response), ["message", "state"])
+
+    def test_unknown_or_duplicate_parts_raise(self):
+        with self.assertRaisesRegex(ValueError, "不支持的顶层字段"):
+            final_request(self.record, None, output_parts=["capture_id", "unknown"])
+        with self.assertRaisesRegex(ValueError, "重复的顶层字段"):
+            final_response(self.record, None, output_parts=["state", "state"])
+
+
+class ShareGPTExportTests(unittest.TestCase):
+    def _rounds(self):
+        tool = {
+            "name": "Bash",
+            "description": "执行命令",
+            "input_schema": {
+                "type": "object",
+                "properties": {"command": {"type": "string"}},
+            },
+        }
+        first_user = {
+            "role": "user",
+            "content": [
+                {
+                    "type": "text",
+                    "text": "检查项目",
+                    "cache_control": {"type": "ephemeral"},
+                }
+            ],
+        }
+        first_response_content = [
+            {"type": "thinking", "thinking": "先查看目录"},
+            {
+                "type": "tool_use",
+                "id": "call_1",
+                "name": "Bash",
+                "input": {"command": "pwd"},
+            },
+        ]
+        first = RoundRecord(
+            number=1,
+            round_dir=Path("round_000001"),
+            request_body={
+                "model": "test-model",
+                "system": [
+                    {"type": "text", "text": "x-anthropic-billing-header: cch=aaa;"},
+                    {"type": "text", "text": "你是编码助手"},
+                ],
+                "tools": [dict(tool, cache_control={"type": "ephemeral"})],
+                "messages": [first_user],
+            },
+            response_message={"role": "assistant", "content": first_response_content},
+        )
+        second = RoundRecord(
+            number=2,
+            round_dir=Path("round_000002"),
+            request_body={
+                "model": "test-model",
+                "system": [
+                    {"type": "text", "text": "x-anthropic-billing-header: cch=bbb;"},
+                    {"type": "text", "text": "你是编码助手"},
+                ],
+                "tools": [tool],
+                "messages": [
+                    {"role": "user", "content": [{"type": "text", "text": "检查项目"}]},
+                    {
+                        "role": "assistant",
+                        "content": [
+                            {
+                                "type": "thinking",
+                                "thinking": "先查看目录",
+                                "signature": "",
+                            },
+                            first_response_content[1],
+                        ],
+                    },
+                    {
+                        "role": "user",
+                        "content": [
+                            {
+                                "type": "tool_result",
+                                "tool_use_id": "call_1",
+                                "content": "/workspace",
+                            }
+                        ],
+                    },
+                ],
+            },
+            response_message={
+                "role": "assistant",
+                "content": [
+                    {"type": "thinking", "thinking": "目录正确"},
+                    {"type": "text", "text": "检查完成"},
+                ],
+            },
+        )
+        return first, second
+
+    def test_nonsemantic_metadata_does_not_split_context(self):
+        first, second = self._rounds()
+        self.assertTrue(context_continues(first, second))
+        changed = RoundRecord(
+            number=second.number,
+            round_dir=second.round_dir,
+            request_body=dict(second.request_body, system="不同的系统提示"),
+            response_message=second.response_message,
+        )
+        self.assertFalse(context_continues(first, changed))
+
+    def test_hybrid_format_and_reasoning_modes(self):
+        first, second = self._rounds()
+        separate = build_sharegpt_record(
+            [first, second], "task__main__1", "separate"
+        )
+        inline = build_sharegpt_record([first, second], "task__main__1", "inline")
+
+        assistant_call = next(
+            message
+            for message in separate["messages"]
+            if message.get("tool_calls")
+        )
+        tool_call = assistant_call["tool_calls"][0]
+        self.assertEqual(tool_call["name"], tool_call["function"]["name"])
+        self.assertEqual(tool_call["arguments"], tool_call["function"]["arguments"])
+        validate_hybrid_tool_call(tool_call)
+        validate_hybrid_tool_definition(separate["tools"][0])
+
+        self.assertTrue(
+            any("reasoning_content" in message for message in separate["messages"])
+        )
+        self.assertFalse(
+            any("<think>" in message.get("content", "") for message in separate["messages"])
+        )
+        self.assertFalse(
+            any("reasoning_content" in message for message in inline["messages"])
+        )
+        self.assertTrue(
+            any("<think>" in message.get("content", "") for message in inline["messages"])
+        )
+
+    def test_conflicting_flat_alias_is_rejected(self):
+        bad_call = {
+            "type": "function",
+            "name": "Bash",
+            "arguments": {"command": "pwd"},
+            "function": {"name": "Bash", "arguments": {"command": "ls"}},
+        }
+        with self.assertRaisesRegex(ValueError, "arguments.*不一致"):
+            validate_hybrid_tool_call(bad_call)
+
+    def test_standard_structure_can_be_disabled(self):
+        first, second = self._rounds()
+        flat = build_sharegpt_record(
+            [first, second],
+            "task__main__1",
+            "separate",
+            standard_structure=False,
+        )
+        assistant_call = next(
+            message
+            for message in flat["messages"]
+            if message.get("tool_calls")
+        )
+        self.assertEqual(
+            set(assistant_call["tool_calls"][0]),
+            {"name", "arguments"},
+        )
+        self.assertEqual(
+            set(flat["tools"][0]),
+            {"name", "description", "parameters"},
+        )
+        tool_result = next(
+            message for message in flat["messages"] if message["role"] == "tool"
+        )
+        self.assertEqual(set(tool_result), {"role", "content"})
+
+    def test_incomplete_agent_is_skipped_and_reported(self):
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            input_root = root / "dataset"
+            output_root = root / "sharegpt"
+            round_dir = input_root / "tasks/task_a/main_agent/round_000001"
+            write_json(
+                round_dir / "request.json",
+                {"body": {"json": {"messages": []}}},
+            )
+            write_json(
+                round_dir / "response.json",
+                {
+                    "transport": {
+                        "aggregation_complete": False,
+                        "transport_error": "CancelledError: client disconnected",
+                        "client_disconnected": True,
+                        "aggregation_errors": [],
+                    },
+                    "message": {"content": []},
+                },
+            )
+
+            report = export_sharegpt(input_root, output_root, "separate")
+            errors = json.loads(
+                (output_root / "export_errors.json").read_text(encoding="utf-8")
+            )
+
+            self.assertEqual(report["skipped_agents"], 1)
+            self.assertEqual(report["sharegpt_files"], 0)
+            self.assertEqual(errors["error_count"], 1)
+            self.assertEqual(errors["errors"][0]["task"], "task_a")
+            self.assertTrue(errors["errors"][0]["details"]["client_disconnected"])
+            self.assertIn("CancelledError", errors["errors"][0]["details"]["transport_error"])
+
+
+class ProxyIntegrationTests(unittest.IsolatedAsyncioTestCase):
+    async def test_proxy_converts_auth_stream_and_preserves_capture(self):
+        import httpx
+
+        from proxy import Settings, create_app
+
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+            seen: dict[str, object] = {}
+
+            async def upstream_handler(request: httpx.Request) -> httpx.Response:
+                seen["url"] = str(request.url)
+                seen["authorization"] = request.headers.get("authorization")
+                seen["client_api_key"] = request.headers.get("x-api-key")
+                seen["body"] = await request.aread()
+                chunks = [
+                    {
+                        "id": "chatcmpl-proxy",
+                        "model": "target-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "delta": {"role": "assistant", "content": "代理成功"},
+                                "finish_reason": None,
+                            }
+                        ],
+                    },
+                    {
+                        "id": "chatcmpl-proxy",
+                        "model": "target-model",
+                        "choices": [
+                            {"index": 0, "delta": {}, "finish_reason": "stop"}
+                        ],
+                    },
+                    {
+                        "id": "chatcmpl-proxy",
+                        "model": "target-model",
+                        "choices": [],
+                        "usage": {"prompt_tokens": 4, "completion_tokens": 2},
+                    },
+                ]
+                stream_body = b"".join(
+                    f"data: {json.dumps(chunk)}\n\n".encode("utf-8")
+                    for chunk in chunks
+                ) + b"data: [DONE]\n\n"
+                return httpx.Response(
+                    200,
+                    headers=[
+                        ("content-type", "text/event-stream"),
+                        ("x-duplicate", "one"),
+                        ("x-duplicate", "two"),
+                    ],
+                    stream=httpx.ByteStream(stream_body),
+                )
+
+            app = create_app(
+                Settings(
+                    listen_host="127.0.0.1",
+                    listen_port=30303,
+                    upstream_url="http://upstream/v1/chat/completions",
+                    log_dir=root / "captures",
+                    timeout_seconds=30,
+                    upstream_model="target-model",
+                    upstream_api_key="upstream-secret",
+                ),
+                upstream_transport=httpx.MockTransport(upstream_handler),
+            )
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://proxy",
+                ) as client:
+                    response = await client.post(
+                        "/v1/messages",
+                        headers={"x-api-key": "harbor-secret"},
+                        json={
+                            "model": "test-model",
+                            "max_tokens": 10,
+                            "messages": [{"role": "user", "content": "hello"}],
+                            "stream": True,
+                        },
+                    )
+
+            self.assertEqual(response.status_code, 200)
+            self.assertEqual(
+                seen["url"], "http://upstream/v1/chat/completions"
+            )
+            self.assertEqual(seen["authorization"], "Bearer upstream-secret")
+            self.assertIsNone(seen["client_api_key"])
+            forwarded = json.loads(seen["body"])
+            self.assertEqual(forwarded["model"], "target-model")
+            self.assertEqual(
+                forwarded["messages"], [{"role": "user", "content": "hello"}]
+            )
+            self.assertTrue(forwarded["stream_options"]["include_usage"])
+            self.assertEqual(response.headers.get_list("x-duplicate"), ["one", "two"])
+            completed = list((root / "captures/raw/completed").iterdir())
+            self.assertEqual(len(completed), 1)
+            captured_response = json.loads(
+                (completed[0] / "response.json").read_text(encoding="utf-8")
+            )
+            captured_request = json.loads(
+                (completed[0] / "request.json").read_text(encoding="utf-8")
+            )
+            self.assertEqual(captured_response["message_id"], "msg_chatcmpl-proxy")
+            self.assertEqual(
+                captured_response["message"]["content"][0]["text"], "代理成功"
+            )
+            self.assertTrue(captured_response["aggregation_complete"])
+            api_key_record = next(
+                item
+                for item in captured_request["headers"]
+                if item["name"].lower() == "x-api-key"
+            )
+            self.assertEqual(api_key_record["value"], "<redacted>")
+
+    async def test_proxy_converts_non_stream_response_and_upstream_error(self):
+        import httpx
+
+        from proxy import Settings, create_app
+
+        with workspace_temporary_directory() as temporary:
+            root = Path(temporary)
+
+            async def upstream_handler(request: httpx.Request) -> httpx.Response:
+                forwarded = json.loads(await request.aread())
+                prompt = forwarded["messages"][-1]["content"]
+                if prompt == "unauthorized":
+                    return httpx.Response(
+                        401,
+                        json={"error": {"message": "bad upstream key", "type": "auth"}},
+                    )
+                return httpx.Response(
+                    200,
+                    json={
+                        "id": "chatcmpl-json",
+                        "model": "target-model",
+                        "choices": [
+                            {
+                                "index": 0,
+                                "finish_reason": "tool_calls",
+                                "message": {
+                                    "role": "assistant",
+                                    "reasoning_content": "先检查",
+                                    "content": None,
+                                    "tool_calls": [
+                                        {
+                                            "id": "call_json",
+                                            "type": "function",
+                                            "function": {
+                                                "name": "Bash",
+                                                "arguments": '{"command":"pwd"}',
+                                            },
+                                        }
+                                    ],
+                                },
+                            }
+                        ],
+                        "usage": {"prompt_tokens": 8, "completion_tokens": 3},
+                    },
+                )
+
+            app = create_app(
+                Settings(
+                    listen_host="127.0.0.1",
+                    listen_port=30303,
+                    upstream_url="http://upstream/v1/chat/completions",
+                    log_dir=root / "captures",
+                    timeout_seconds=30,
+                ),
+                upstream_transport=httpx.MockTransport(upstream_handler),
+            )
+            async with app.router.lifespan_context(app):
+                async with httpx.AsyncClient(
+                    transport=httpx.ASGITransport(app=app),
+                    base_url="http://proxy",
+                ) as client:
+                    success = await client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "target-model",
+                            "max_tokens": 10,
+                            "messages": [{"role": "user", "content": "tool"}],
+                        },
+                    )
+                    failure = await client.post(
+                        "/v1/messages",
+                        json={
+                            "model": "target-model",
+                            "max_tokens": 10,
+                            "messages": [
+                                {"role": "user", "content": "unauthorized"}
+                            ],
+                        },
+                    )
+
+            self.assertEqual(success.status_code, 200)
+            message = success.json()
+            self.assertEqual(message["id"], "msg_chatcmpl-json")
+            self.assertEqual(
+                [block["type"] for block in message["content"]],
+                ["thinking", "tool_use"],
+            )
+            self.assertEqual(message["content"][1]["input"], {"command": "pwd"})
+            self.assertEqual(message["stop_reason"], "tool_use")
+            self.assertEqual(failure.status_code, 401)
+            self.assertEqual(failure.json()["type"], "error")
+            self.assertEqual(failure.json()["error"]["type"], "authentication_error")
+            self.assertEqual(
+                len(list((root / "captures/raw/completed").iterdir())), 2
+            )
+
+
+class ConfigurationTests(unittest.TestCase):
+    def test_authentication_comes_from_openai_environment(self):
+        with mock.patch.dict("os.environ", {"OPENAI_API_KEY": "secret"}, clear=True):
+            settings = parse_args(
+                [
+                    "--upstream-url",
+                    "http://upstream/v1/chat/completions",
+                    "--listen-host",
+                    "127.0.0.1",
+                ]
+            )
+        self.assertEqual(settings.upstream_api_key, "secret")
+        records = header_records([("X-Api-Key", "secret")])
+        self.assertEqual(records[0]["value"], "<redacted>")
+        self.assertIn("value_sha256", records[0])
+
+
+if __name__ == "__main__":
+    unittest.main()
